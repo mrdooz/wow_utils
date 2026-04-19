@@ -1,0 +1,8 @@
+## Interface: 120000
+## Title: Thunder Blast Alert
+## Notes: Plays a sound when Thunder Blast reaches 2 stacks.
+## Version: 0.1
+## Author: you
+## SavedVariables: ThunderBlastAlertDB
+
+ThunderBlastAlert.lua
