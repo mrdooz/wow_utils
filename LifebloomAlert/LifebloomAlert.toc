@@ -1,0 +1,7 @@
+## Interface: 120000
+## Title: Lifebloom Alert
+## Notes: Plays the Cash Register sound 3 seconds before Lifebloom expires.
+## Version: 0.1
+## Author: you
+
+LifebloomAlert.lua
