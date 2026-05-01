@@ -17,6 +17,13 @@
 -- UNIT_SPELLCAST_SENT (works for target frames, mouseover, clique, Healbot,
 -- etc. — anything that resolves a unit before the cast goes out).
 --
+-- Swiftmend
+-- ---------
+-- Casting Swiftmend on the same unit that has our Lifebloom extends the bloom
+-- by 8s, capped at the same pandemic max (DURATION * 1.3). We track Swiftmend
+-- the same way as Lifebloom: SENT stashes the target, SUCCEEDED applies it if
+-- the target matches the active bloom.
+--
 -- Caveats we can't address inside Midnight's API restrictions:
 --   * Bloom ending without a cast (target dies, dispelled, you die) — our model
 --     thinks it's still up, so a recast within 15s carries phantom pandemic.
@@ -28,9 +35,12 @@ local _, playerClass = UnitClass("player")
 if playerClass ~= "DRUID" then return end
 
 local LIFEBLOOM_SPELL_ID = 33763
+local SWIFTMEND_SPELL_ID = 18562
 local DURATION = 15
 local WARN_LEAD = 3
 local PANDEMIC_FACTOR = 0.3
+local MAX_DURATION = DURATION + DURATION * PANDEMIC_FACTOR
+local SWIFTMEND_EXTEND = 8
 -- FileDataID for the cash register sound. Path-based lookup
 -- ("Sound\Interface\CashRegister.ogg") played nothing; FileDataID works.
 local ALERT_SOUND = 7466070
@@ -40,9 +50,10 @@ local warnTimer = nil
 local lastCastTime = 0
 local lastDuration = 0
 local lastTargetName = nil
--- Stashed from UNIT_SPELLCAST_SENT, consumed by the next SUCCEEDED. Lifebloom
--- is instant, so SENT immediately precedes SUCCEEDED with nothing in between.
-local pendingTarget = nil
+-- Stashed from UNIT_SPELLCAST_SENT, consumed by the next SUCCEEDED. Both
+-- Lifebloom and Swiftmend are instant, so SENT immediately precedes SUCCEEDED.
+local pendingLifebloomTarget = nil
+local pendingSwiftmendTarget = nil
 
 local function dprint(fmt, ...)
     if DEBUG then print(("|cff33ff99LBA|r " .. fmt):format(...)) end
@@ -64,11 +75,22 @@ local function FullReset(reason)
     lastCastTime = 0
     lastDuration = 0
     lastTargetName = nil
-    pendingTarget = nil
+    pendingLifebloomTarget = nil
+    pendingSwiftmendTarget = nil
+end
+
+local function ScheduleWarning(remaining)
+    CancelTimer("restart")
+    local delay = remaining - WARN_LEAD
+    if delay <= 0 then return end
+    warnTimer = C_Timer.NewTimer(delay, function()
+        warnTimer = nil
+        dprint("alert!")
+        PlayAlert()
+    end)
 end
 
 local function StartTimer(target)
-    CancelTimer("restart")
     local now = GetTime()
     local carryover = 0
     -- Pandemic carry only applies on a same-target refresh. Unknown target
@@ -82,13 +104,27 @@ local function StartTimer(target)
     lastCastTime = now
     lastDuration = DURATION + carryover
     lastTargetName = target
-    local delay = lastDuration - WARN_LEAD
-    warnTimer = C_Timer.NewTimer(delay, function()
-        warnTimer = nil
-        dprint("alert!")
-        PlayAlert()
-    end)
-    dprint("timer set for %.1fs (target=%s carry=%.1fs)", delay, tostring(target), carryover)
+    ScheduleWarning(lastDuration)
+    dprint("timer set for %.1fs (target=%s carry=%.1fs)", lastDuration - WARN_LEAD, tostring(target), carryover)
+end
+
+local function ExtendForSwiftmend(target)
+    if lastCastTime == 0 or not target or target ~= lastTargetName then
+        dprint("swiftmend: no extend (target=%s lastTarget=%s)", tostring(target), tostring(lastTargetName))
+        return
+    end
+    local now = GetTime()
+    local remaining = lastDuration - (now - lastCastTime)
+    if remaining <= 0 then
+        dprint("swiftmend: bloom already expired in model, no extend")
+        return
+    end
+    local extended = math.min(remaining + SWIFTMEND_EXTEND, MAX_DURATION)
+    -- Re-anchor to now so the schedule math stays simple.
+    lastCastTime = now
+    lastDuration = extended
+    ScheduleWarning(extended)
+    dprint("swiftmend extended bloom: %.1fs -> %.1fs (target=%s)", remaining, extended, tostring(target))
 end
 
 local frame = CreateFrame("Frame")
@@ -102,14 +138,21 @@ frame:SetScript("OnEvent", function(_, event, ...)
     end
     if event == "UNIT_SPELLCAST_SENT" then
         local _unit, target, _castGUID, spellID = ...
-        if spellID == LIFEBLOOM_SPELL_ID then pendingTarget = target end
+        if spellID == LIFEBLOOM_SPELL_ID then
+            pendingLifebloomTarget = target
+        elseif spellID == SWIFTMEND_SPELL_ID then
+            pendingSwiftmendTarget = target
+        end
         return
     end
     if event == "UNIT_SPELLCAST_SUCCEEDED" then
         local _unit, _castGUID, spellID = ...
         if spellID == LIFEBLOOM_SPELL_ID then
-            StartTimer(pendingTarget)
-            pendingTarget = nil
+            StartTimer(pendingLifebloomTarget)
+            pendingLifebloomTarget = nil
+        elseif spellID == SWIFTMEND_SPELL_ID then
+            ExtendForSwiftmend(pendingSwiftmendTarget)
+            pendingSwiftmendTarget = nil
         end
     end
 end)
