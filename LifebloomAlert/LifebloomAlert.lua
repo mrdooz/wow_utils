@@ -2,58 +2,36 @@
 --
 -- Tracking strategy
 -- -----------------
--- Same constraint as ThunderBlastAlert: Midnight taints aura-read APIs inside
--- automatic contexts (UNIT_AURA handlers, C_Timer callbacks), so we can't poll
--- the buff's remaining duration. Instead UNIT_SPELLCAST_SUCCEEDED is the source
--- of truth: each successful Lifebloom cast (re)starts a local timer for
--- (DURATION - WARN_LEAD) seconds. When the timer fires, play the sound.
+-- Polls C_UnitAuras.GetAuraDataBySpellName from OnUpdate every 0.25s. Walks a
+-- cached unit list (player, target, focus, mouseover, party/raid frames) and
+-- returns the first Lifebloom whose source is the player. The aura's
+-- expirationTime is the source of truth — Blizzard already accounts for
+-- pandemic refreshes, Swiftmend extensions, dispels, target death, and any
+-- other bloom-touching effect. No local state to keep in sync.
 --
--- Pandemic
--- --------
--- Refreshing a HoT carries the remaining duration (capped at 30% of base) into
--- the new duration. We mirror that math from local cast times so refreshes stay
--- in sync without ever reading the aura. Carry only applies when the new cast
--- targets the same unit as the previous one; we resolve the target from
--- UNIT_SPELLCAST_SENT (works for target frames, mouseover, clique, Healbot,
--- etc. — anything that resolves a unit before the cast goes out).
---
--- Swiftmend
--- ---------
--- Casting Swiftmend on the same unit that has our Lifebloom extends the bloom
--- by 8s, capped at the same pandemic max (DURATION * 1.3). We track Swiftmend
--- the same way as Lifebloom: SENT stashes the target, SUCCEEDED applies it if
--- the target matches the active bloom.
---
--- Caveats we can't address inside Midnight's API restrictions:
---   * Bloom ending without a cast (target dies, dispelled, you die) — our model
---     thinks it's still up, so a recast within 15s carries phantom pandemic.
---   * Auto-applies from procs/talents — no SUCCEEDED event for those.
---   * Reload mid-bloom resets state; first post-reload cast skips carry.
---   * Use /lba reset to force a clean slate.
+-- A previous version of this addon avoided aura reads entirely because of
+-- Midnight's taint on aura APIs in automatic contexts. That comment called out
+-- UNIT_AURA handlers and C_Timer callbacks specifically; OnUpdate appears to
+-- be safe (LifebloomTracker uses the same approach and works). If alerts ever
+-- silently stop after a Midnight patch, taint is the first thing to suspect.
 
 local _, playerClass = UnitClass("player")
 if playerClass ~= "DRUID" then return end
 
 local LIFEBLOOM_SPELL_ID = 33763
-local SWIFTMEND_SPELL_ID = 18562
-local DURATION = 15
+local LIFEBLOOM_SPELL_NAME  -- cached after PLAYER_ENTERING_WORLD when API is ready
 local WARN_LEAD = 3
-local PANDEMIC_FACTOR = 0.3
-local MAX_DURATION = DURATION + DURATION * PANDEMIC_FACTOR
-local SWIFTMEND_EXTEND = 8
+local SCAN_INTERVAL = 0.25
 -- FileDataID for the cash register sound. Path-based lookup
 -- ("Sound\Interface\CashRegister.ogg") played nothing; FileDataID works.
 local ALERT_SOUND = 7466070
 
 local DEBUG = false
-local warnTimer = nil
-local lastCastTime = 0
-local lastDuration = 0
-local lastTargetName = nil
--- Stashed from UNIT_SPELLCAST_SENT, consumed by the next SUCCEEDED. Both
--- Lifebloom and Swiftmend are instant, so SENT immediately precedes SUCCEEDED.
-local pendingLifebloomTarget = nil
-local pendingSwiftmendTarget = nil
+local cachedUnits = { "player", "target", "focus", "mouseover" }
+-- expirationTime of the bloom we last alerted on. A refresh, recast, or new
+-- target produces a different expirationTime, which re-arms the alert.
+local lastWarnedExpire = 0
+local scanAccum = 0
 
 local function dprint(fmt, ...)
     if DEBUG then print(("|cff33ff99LBA|r " .. fmt):format(...)) end
@@ -63,97 +41,57 @@ local function PlayAlert()
     PlaySoundFile(ALERT_SOUND, "Master")
 end
 
-local function CancelTimer(reason)
-    if warnTimer then
-        warnTimer:Cancel(); warnTimer = nil
-        dprint("timer cancelled (%s)", reason)
+local function RebuildUnitsCache()
+    cachedUnits = { "player", "target", "focus", "mouseover" }
+    if IsInRaid() then
+        for i = 1, 40 do cachedUnits[#cachedUnits + 1] = "raid" .. i end
+    elseif IsInGroup() then
+        for i = 1, 4 do cachedUnits[#cachedUnits + 1] = "party" .. i end
     end
 end
 
-local function FullReset(reason)
-    CancelTimer(reason)
-    lastCastTime = 0
-    lastDuration = 0
-    lastTargetName = nil
-    pendingLifebloomTarget = nil
-    pendingSwiftmendTarget = nil
-end
-
-local function ScheduleWarning(remaining)
-    CancelTimer("restart")
-    local delay = remaining - WARN_LEAD
-    if delay <= 0 then return end
-    warnTimer = C_Timer.NewTimer(delay, function()
-        warnTimer = nil
-        dprint("alert!")
-        PlayAlert()
-    end)
-end
-
-local function StartTimer(target)
-    local now = GetTime()
-    local carryover = 0
-    -- Pandemic carry only applies on a same-target refresh. Unknown target
-    -- (SENT didn't fire) is treated as fresh — safer to fire early than late.
-    if lastCastTime > 0 and target and target == lastTargetName then
-        -- Subtract from lastDuration (not DURATION): a previous pandemic refresh
-        -- extended the bloom past the base, and that remainder is still real.
-        local remaining = math.max(0, lastDuration - (now - lastCastTime))
-        carryover = math.min(remaining, DURATION * PANDEMIC_FACTOR)
+local function FindMyLifebloom()
+    if not LIFEBLOOM_SPELL_NAME then return nil end
+    for _, unit in ipairs(cachedUnits) do
+        if UnitExists(unit) then
+            local aura = C_UnitAuras.GetAuraDataBySpellName(unit, LIFEBLOOM_SPELL_NAME, "HELPFUL")
+            if aura and aura.sourceUnit == "player" then
+                return aura, unit
+            end
+        end
     end
-    lastCastTime = now
-    lastDuration = DURATION + carryover
-    lastTargetName = target
-    ScheduleWarning(lastDuration)
-    dprint("timer set for %.1fs (target=%s carry=%.1fs)", lastDuration - WARN_LEAD, tostring(target), carryover)
-end
-
-local function ExtendForSwiftmend(target)
-    if lastCastTime == 0 or not target or target ~= lastTargetName then
-        dprint("swiftmend: no extend (target=%s lastTarget=%s)", tostring(target), tostring(lastTargetName))
-        return
-    end
-    local now = GetTime()
-    local remaining = lastDuration - (now - lastCastTime)
-    if remaining <= 0 then
-        dprint("swiftmend: bloom already expired in model, no extend")
-        return
-    end
-    local extended = math.min(remaining + SWIFTMEND_EXTEND, MAX_DURATION)
-    -- Re-anchor to now so the schedule math stays simple.
-    lastCastTime = now
-    lastDuration = extended
-    ScheduleWarning(extended)
-    dprint("swiftmend extended bloom: %.1fs -> %.1fs (target=%s)", remaining, extended, tostring(target))
+    return nil, nil
 end
 
 local frame = CreateFrame("Frame")
 frame:RegisterEvent("PLAYER_ENTERING_WORLD")
-frame:RegisterUnitEvent("UNIT_SPELLCAST_SENT", "player")
-frame:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player")
-frame:SetScript("OnEvent", function(_, event, ...)
+frame:RegisterEvent("GROUP_ROSTER_UPDATE")
+frame:SetScript("OnEvent", function(_, event)
     if event == "PLAYER_ENTERING_WORLD" then
-        FullReset("reload")
-        return
-    end
-    if event == "UNIT_SPELLCAST_SENT" then
-        local _unit, target, _castGUID, spellID = ...
-        if spellID == LIFEBLOOM_SPELL_ID then
-            pendingLifebloomTarget = target
-        elseif spellID == SWIFTMEND_SPELL_ID then
-            pendingSwiftmendTarget = target
+        if not LIFEBLOOM_SPELL_NAME then
+            LIFEBLOOM_SPELL_NAME = C_Spell.GetSpellName(LIFEBLOOM_SPELL_ID)
         end
-        return
+        RebuildUnitsCache()
+        lastWarnedExpire = 0
+    elseif event == "GROUP_ROSTER_UPDATE" then
+        RebuildUnitsCache()
     end
-    if event == "UNIT_SPELLCAST_SUCCEEDED" then
-        local _unit, _castGUID, spellID = ...
-        if spellID == LIFEBLOOM_SPELL_ID then
-            StartTimer(pendingLifebloomTarget)
-            pendingLifebloomTarget = nil
-        elseif spellID == SWIFTMEND_SPELL_ID then
-            ExtendForSwiftmend(pendingSwiftmendTarget)
-            pendingSwiftmendTarget = nil
-        end
+end)
+
+frame:SetScript("OnUpdate", function(_, elapsed)
+    scanAccum = scanAccum + elapsed
+    if scanAccum < SCAN_INTERVAL then return end
+    scanAccum = 0
+
+    local aura = FindMyLifebloom()
+    if not aura then return end
+
+    local expire = aura.expirationTime or 0
+    local rem = expire - GetTime()
+    if rem > 0 and rem <= WARN_LEAD and expire ~= lastWarnedExpire then
+        lastWarnedExpire = expire
+        dprint("alert! rem=%.2f", rem)
+        PlayAlert()
     end
 end)
 
@@ -167,10 +105,17 @@ SlashCmdList.LIFEBLOOMALERT = function(msg)
     if cmd == "debug" then
         DEBUG = not DEBUG
         print(("|cff33ff99LBA|r debug = %s"):format(tostring(DEBUG)))
-    elseif cmd == "reset" then
-        FullReset("manual")
     elseif cmd == "test" then
         PlayAlert()
+    elseif cmd == "status" then
+        local aura, unit = FindMyLifebloom()
+        if aura then
+            local name = (unit and UnitName(unit)) or unit or "?"
+            print(("|cff33ff99LBA|r bloom on %s, %.1fs remaining"):format(
+                name, (aura.expirationTime or 0) - GetTime()))
+        else
+            print("|cff33ff99LBA|r no bloom found")
+        end
     elseif cmd == "kit" then
         local n = tonumber(rest)
         if not n then print("|cffff5555LBA|r usage: /lba kit <number>"); return end
@@ -182,6 +127,6 @@ SlashCmdList.LIFEBLOOMALERT = function(msg)
         local ok = PlaySoundFile(arg, "Master")
         print(("|cff33ff99LBA|r file %s: %s"):format(tostring(arg), ok and "playing" or "rejected (bad file/path?)"))
     else
-        print("|cff33ff99LBA|r cmds: test | reset | debug | kit <id> | file <id_or_path>")
+        print("|cff33ff99LBA|r cmds: test | status | debug | kit <id> | file <id_or_path>")
     end
 end
